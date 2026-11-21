@@ -9,6 +9,7 @@ class Movement:
 
     def __init__(self, bot):
         self.bot = bot
+        self.escape_committed = False
 
     def projectiles(self, obs):
         me = obs["self"]
@@ -135,11 +136,62 @@ class Movement:
             score += 0.6 * abs(math.sin(yaw - yaw_to_target))
         return score - self.impact(me, yaw, speed, paths) * 4
 
+    def escape_lanes(self, me, tracks, state):
+        if state != "EVADE" or not self.bot.v13["ESCAPE"]:
+            self.escape_committed = False
+            return ()
+        immediate = sum(not t.covered and t.distance < 78 for t in tracks)
+        if immediate >= 3:
+            self.escape_committed = True
+        if not self.escape_committed:
+            return ()
+        candidates = [t for t in tracks if t.distance < min(120, t.reach + 10)]
+        if len(candidates) < 2:
+            return ()
+        if len(candidates) == 2 and me["hp"] > me["max_hp"] * 0.7:
+            return ()
+        candidates.sort(key=lambda t: pressure_weight(t, t.distance) * (0.6 if t.covered else 1),
+                        reverse=True)
+        return tuple((t, t.predict(2.45)) for t in candidates[:5])
+
+    def escape_cost(self, me, zone, yaw, speed, lanes):
+        """Combat pressure at a reachable escape endpoint, in movement-score units."""
+        arena, stats = self.bot.arena, me["stats"]
+        dx, dy = math.cos(yaw), math.sin(yaw)
+        vx, vy = me["vel"][:2]
+        accel = stats["ground_accel"] if me["grounded"] else stats["air_accel"]
+        duration = 2.45
+        ramp = min(duration, math.hypot(dx * speed - vx, dy * speed - vy) / max(accel, 1))
+        vx = vx * ramp / 2 + dx * speed * (duration - ramp / 2)
+        vy = vy * ramp / 2 + dy * speed * (duration - ramp / 2)
+        wanted = math.hypot(vx, vy)
+        if wanted < 0.01:
+            return 2
+        travel, z = arena.walk(me["pos"], vx / wanted, vy / wanted, wanted, stats)
+        x = me["pos"][0] + vx * travel / wanted
+        y = me["pos"][1] + vy * travel / wanted
+        body = (x, y, z + stats["height"] / 2)
+        muzzle = self.bot.config["mech"]["muzzle_height"]
+        incoming = intercept = 0.0
+        for track, (ex, ey, ez) in lanes:
+            dist = math.hypot(ex - x, ey - y)
+            pressure = pressure_weight(track, dist)
+            if pressure > 0.08 and arena.clear((ex, ey, ez + muzzle), body, spacing=6):
+                incoming += min(4, pressure)
+                # A hunter near the exit can intercept the retreat before it opens distance.
+                intercept += max(0, 1 - dist / 34)
+        edge = arena.edge(x, y)
+        exit_distance = arena.walk((x, y, z), dx, dy, 8, stats)[0]
+        zone_gap = max(0, math.dist((x, y), zone["next_center"]) - zone["next_radius"])
+        return (0.69 * incoming + 0.61 * intercept + 0.075 * (wanted - travel)
+                + 0.12 * (8 - exit_distance) + 0.085 * max(0, 10 - edge) + 0.05 * zone_gap)
+
     def choose(self, obs, tracks, state, target, loot):
         bot, me = self.bot, obs["self"]
         stats = me["stats"]
         goal, urgency = bot.zone_goal(obs)
         paths = self.projectiles(obs)
+        lanes = self.escape_lanes(me, tracks, state)
         if state in ("POSITION", "RECOVER") and not paths:
             relevant = any((not t.covered and t.distance < t.reach) or t.distance < 70 for t in tracks)
             if loot is not None or not relevant:
@@ -159,13 +211,21 @@ class Movement:
             return self.score(obs, yaw, speed, goal, urgency, predictions, target, state, paths)
 
         scored = sorted(((score(yaw, walk), yaw) for yaw in options), reverse=True)
+        if lanes:
+            # Restrict the additional horizon to competitive directions.
+            scored = sorted(((value - self.escape_cost(me, obs["zone"], yaw, walk, lanes), yaw)
+                             for value, yaw in scored[:6]), reverse=True)
         best, yaw = scored[0]
         boosted = False
         reserve = stats["boost_drain"] * (0.08 if state == "EMERGENCY_ZONE" else 1.1)
         if me["grounded"] and me["energy"] > reserve and (state in ("EVADE", "EMERGENCY_ZONE") or paths):
             cost = 0.16 if state == "EMERGENCY_ZONE" else 0.7
+            if lanes and sum(not track.covered and track.distance < 85 for track, _ in lanes) >= 3:
+                cost = 0.35
             for option in dict.fromkeys((yaw, goal, scored[1][1], scored[2][1])):
                 value = score(option, run) + (0.45 * math.cos(option - goal) if state == "EMERGENCY_ZONE" else 0)
+                if lanes:
+                    value -= self.escape_cost(me, obs["zone"], option, run, lanes)
                 if value - cost > best:
                     best, yaw, boosted = value - cost, option, True
         bot.heading = math.atan2(math.sin(yaw), math.cos(yaw))

@@ -1,4 +1,5 @@
-"""Phoenix V10 integrates the tactical modules while retaining the V5 entry points."""
+"""Phoenix adaptive engagement and damage-aware escape experiments."""
+from collections import deque
 import math
 import os
 
@@ -15,6 +16,13 @@ class Bot(Baseline):
         super().__init__(hello)
         self.flags = {key: os.getenv("V10_" + key + "_ENABLED", "1").lower() not in ("0", "false")
                       for key in ("TRACKING", "COMBAT", "MOVEMENT", "TACTICS")}
+        self.v13 = {key: os.getenv("V13_" + key + "_ENABLED", default).lower() not in ("0", "false")
+                    for key, default in (("ENGAGEMENT", "0"), ("ESCAPE", "1"))}
+        if any(self.v13.values()):
+            self.name = "phoenix-v13-survival"
+        self.engagement = None
+        self.trade = deque(maxlen=30)
+        self.disengage_until = -math.inf
         self.intelligence = Intelligence(self.config, self.arena)
         self.fire_control = FireControl(self)
         self.planner = Movement(self)
@@ -72,7 +80,58 @@ class Bot(Baseline):
             options.extend((yaw, yaw - self.front_arc + 0.05, yaw + self.front_arc - 0.05))
         return min(options, key=lambda yaw: self.armor_risk(yaw) + 0.10 * angle_error(yaw, actual))
 
+    def engagement_target(self, obs, target):
+        """Keep firing while declining a losing pursuit or an opening flank."""
+        me = obs["self"]
+        now = obs["t"]
+        if target is None:
+            self.engagement = self.state
+            return self.state, None
+        stats = me["stats"]
+        weapons = [weapon for weapon in me["weapons"] if weapon is not None]
+        finish_threshold = self.config["weapons"]["gun"]["damage"] * (
+            1 + self.config["cubes"]["damage_per_cube"] * min(me["cubes"], self.config["cubes"]["stat_cap"]))
+        finish = target.actor.get("hp", math.inf) <= finish_threshold and target.distance < 85
+        gun_ready = any(w["kind"] == "gun" and w["cooldown"] <= 0.25
+                        and not w["reload"] and w["ammo"] for w in weapons)
+        if finish and gun_ready:
+            self.engagement = "FINISH"
+            return self.state, target
+        recent_in = sum(amount_in for _, amount_in, _ in self.trade)
+        recent_out = sum(amount_out for _, _, amount_out in self.trade)
+        reinforcement = False
+        if len(self.tracks) > 1 and me["hp"] < me["max_hp"] * 0.80:
+            body = (*me["pos"][:2], me["pos"][2] + stats["height"] / 2)
+            muzzle = self.config["mech"]["muzzle_height"]
+            for track in self.tracks:
+                if track is target or track.distance > 100 or track.closing < 2 or track.age > 2:
+                    continue
+                x, y, z = track.predict(1.1)
+                if self.arena.clear((x, y, z + muzzle), body, spacing=5):
+                    reinforcement = True
+                    break
+        losing_trade = (me["hp"] < 0.55 * me["max_hp"] and recent_in > 95
+                        and recent_in > 1.5 * recent_out + 45)
+        # Even a favorable exchange is unsafe when the health budget runs out first.
+        critical_exposure = (me["hp"] < 0.38 * me["max_hp"] and recent_in >= 50
+                             and me["hp"] < 2.6 * recent_in)
+        if losing_trade or critical_exposure or reinforcement:
+            self.disengage_until = now + 0.55
+        if now < self.disengage_until:
+            self.engagement = "DISENGAGE"
+            return "EVADE", None
+        self.engagement = self.state
+        return self.state, target
+
     def threats(self, obs):
+        if self.v13["ENGAGEMENT"]:
+            now = obs["t"]
+            while self.trade and now - self.trade[0][0] > 1.6:
+                self.trade.popleft()
+            damage_in = sum(e["amount"] for e in obs["events"] if e["type"] == "damaged" and e.get("weapon") != "zone")
+            damage_out = sum(e["amount"] for e in obs["events"] if e["type"] == "hit")
+            if damage_in or damage_out:
+                self.trade.append((now, damage_in, damage_out))
         enemies = super().threats(obs)
         if any(self.flags.values()):
             self.tracks = self.intelligence.update(obs, self.flags["TRACKING"])
@@ -89,7 +148,10 @@ class Bot(Baseline):
         if not self.flags["MOVEMENT"]:
             return super().movement(obs, enemies, loot_goal)
         target = self.active[0] if self.state == "ENGAGE" and len(self.active) == 1 else None
-        return self.planner.choose(obs, self.tracks, self.state, target, loot_goal)
+        state = self.state
+        if self.v13["ENGAGEMENT"]:
+            state, target = self.engagement_target(obs, target)
+        return self.planner.choose(obs, self.tracks, state, target, loot_goal)
 
     def armor_yaw(self, obs, enemies, default):
         if self.flags["TACTICS"] and self.lanes:

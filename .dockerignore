@@ -2,3 +2,6 @@ __pycache__/
 test_*.py
 diagnose.py
 README.md
+.git
+diagnose_survival.py
+PHOENIX_V13_REPORT.md

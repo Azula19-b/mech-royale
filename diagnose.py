@@ -69,6 +69,7 @@ class Scenario:
         self.obs["mechs"] = [enemy(x, y, identifier=i) for i, (x, y) in enumerate(attackers, 1)]
         self.obs["zone"].update(center=list(center), next_center=list(center), radius=large,
                                 next_radius=small, shrink_start=4, shrink_end=15)
+        self.initial_attackers = tuple(attackers)
         self.large = large
         self.last_damage = self.last_spend = -10
         self.stall = 0
@@ -105,6 +106,9 @@ class Scenario:
             ratio = traveled / distance
             me["pos"] = [x + vx * 0.1 * ratio, y + vy * 0.1 * ratio, z]
             me["vel"] = [vx * ratio, vy * ratio, 0]
+        m["distance_traveled"] += traveled
+        clearance = self.arena.edge(*me["pos"][:2]) - stats["radius"]
+        m["minimum_boundary_clearance"] = min(m.get("minimum_boundary_clearance", math.inf), clearance)
         m["collision"] += traveled + 0.001 < distance
         self.stall = self.stall + 1 if traveled < 0.08 and math.hypot(dx, dy) > 0.5 else 0
         m["stuck"] += self.stall >= 10
@@ -133,6 +137,7 @@ class Scenario:
             damage = zone["dps"] / 10
             obs["events"].append({"type": "damaged", "amount": damage, "weapon": "zone", "bearing": None, "by": None})
             m["zone_out"] += 1
+            m["zone_damage"] += damage
             m["evacuation_failure"] += fraction == 1
 
         exposed = []
@@ -195,12 +200,15 @@ class Scenario:
         incoming = sum(e["amount"] for e in obs["events"] if e["type"] == "damaged")
         m["damage_in"] += incoming
         me["hp"] -= incoming
-        if obs["events"]:
+        if any(e["type"] in ("damaged", "hit") for e in obs["events"]):
+            m["regen_interruptions"] += (me["hp"] < me["max_hp"]
+                                          and now - self.last_damage >= stats["regen_delay"] - 0.5)
             self.last_damage = now
         elif now - self.last_damage >= stats["regen_delay"] and me["in_zone"]:
             me["hp"] = min(me["max_hp"], me["hp"] + stats["regen_per_s"] / 10)
         m["survival_s"] = now - 1 + 0.1
         self.dead = me["hp"] <= 0
+        m["deaths"] += self.dead
         obs["tick"] += 2
         obs["t"] = round(now + 0.1, 2)
 
@@ -243,6 +251,7 @@ class Scenario:
                 if owner is not None:
                     m["hits_received"] += 1
                     m["rear_hits"] += rear
+                    m["rear_damage"] += damage if rear else 0
                     events.append({"type": "damaged", "by": owner, "amount": damage,
                                    "weapon": "gun", "bearing": direction, "rear": rear})
                 else:
@@ -260,7 +269,7 @@ class Scenario:
         targets[:] = [actor for actor in targets if actor["hp"] > 0]
         self.obs["alive"] = len(targets) + 1
         self.shots = survivors
-        self.obs["projectiles"] = [{"id": i, "kind": "gun", "pos": p, "vel": v}
+        self.obs["projectiles"] = [{"id": i, "kind": "gun", "pos": list(p), "vel": list(v)}
                                    for i, (p, v, _, owner, _) in enumerate(survivors) if owner is not None]
 
 
@@ -304,12 +313,19 @@ def run(command, message, schema, scenario, count, stress=False):
                 raise RuntimeError(f"invalid action for tick {scenario.obs['tick']}: {act!r} {errors}")
             times.append((at - start) * 1000)
             scenario.advance(act)
-            if scenario.dead:
-                if not stress:
-                    break
-                # Keep the observation load high. The reset run measures timing only.
-                scenario.obs["self"]["hp"] = scenario.obs["self"]["max_hp"]
-                scenario.dead = False
+            if scenario.dead and not stress:
+                break
+            if stress:
+                # Replenish attackers for sustained observation load. Timing only.
+                actors = scenario.obs["mechs"]
+                present = {actor["id"] for actor in actors}
+                for i, (x, y) in enumerate(scenario.initial_attackers, 1):
+                    if i not in present:
+                        actors.append(enemy(x, y, identifier=i))
+                scenario.obs["alive"] = len(actors) + 1
+                if scenario.dead:
+                    scenario.obs["self"]["hp"] = scenario.obs["self"]["max_hp"]
+                    scenario.dead = False
         bot.send({"type": "end", "place": 1, "kills": 0})
         bot.proc.stdin.close()
         if bot.proc.wait(timeout=5):
@@ -362,7 +378,7 @@ def main():
             times.extend(sample)
             metrics = " ".join(f"{key}={value:.1f}" if isinstance(value, float) else f"{key}={value}"
                                for key, value in sorted(scenario.metrics.items()))
-            details = "HP reset stress (timing only)" if args.stress else metrics
+            details = "HP reset and attackers replenished (timing only)" if args.stress else metrics
             print(f"{name}: {summary(sample)} {details}", file=sys.stderr)
         budget = message["config"]["bot"]["tick_budget_ms"]
         late = sum(t > budget for t in times)
