@@ -437,4 +437,158 @@ class Bot:
         return action
 
 
-mechfight.run(Bot)
+class RooftopBot(Bot):
+    """Experimental placement-first controller: roof refuge, silence and timed evacuation."""
+    name = "mech-roof-survivor-v3"
+
+    def __init__(self, hello):
+        super().__init__(hello)
+        self.roofs = []
+        self.roof = None
+        self.roof_started = -1e9
+        self.last_hp = None
+        self.last_hp_hit = -1e9
+        self.roof_fail_until = -1e9
+        self.roof_last_pos = None
+        self.roof_still = 0
+        for xmin, ymin, xmax, ymax, base, top, ring, holes in self.prisms:
+            width, height = xmax - xmin, ymax - ymin
+            if width < 16 or height < 13 or top - base < 7:
+                continue
+            if width > 175 or height > 175:
+                continue
+            # Choose a real interior point, not merely the bounding-box centre.
+            for fx, fy in ((.5, .5), (.35, .5), (.65, .5), (.5, .35), (.5, .65)):
+                x, y = xmin + width * fx, ymin + height * fy
+                if self._inside(x, y, ring) and not any(self._inside(x, y, h) for h in holes):
+                    self.roofs.append((x, y, top, xmin, ymin, xmax, ymax, ring, holes))
+                    break
+
+    def _forecast(self, obs):
+        z, t = obs["zone"], obs["t"]
+        if t < z["shrink_end"]:
+            return z["next_center"], z["next_radius"]
+        return z["center"], z["radius"]
+
+    def _roof_valid(self, roof, obs):
+        c, r = self._forecast(obs)
+        x, y = roof[0], roof[1]
+        # When the next safe circle is very small, leave rooftops for the zone.
+        return r > 58 and math.hypot(x - c[0], y - c[1]) < r - 16
+
+    def _choose_roof(self, obs, me, foes):
+        p, t = me["pos"], obs["t"]
+        if self.roof and self._roof_valid(self.roof, obs):
+            # Keep a committed plan; switching rooftops every observation is fatal.
+            if t - self.roof_started < 35:
+                return self.roof
+            if p[2] >= self.roof[2] - 1.5 and self._inside(p[0], p[1], self.roof[7]):
+                return self.roof
+        if t < self.roof_fail_until or me["energy"] < 30:
+            return None
+        chosen, best = None, 1e20
+        for roof in self.roofs:
+            x, y, top = roof[:3]
+            distance = math.hypot(p[0] - x, p[1] - y)
+            height = top - p[2]
+            if distance > 115 or height < 5 or height > 42:
+                continue
+            if not self._roof_valid(roof, obs):
+                continue
+            # Prefer near, moderate-height roofs outside enemy clustering.
+            enemy_risk = sum(max(0, 115 - math.hypot(e["pos"][0] - x, e["pos"][1] - y)) * .24 for e in foes)
+            score = distance + max(0, height - 12) * .4 + enemy_risk
+            if score < best:
+                best, chosen = score, roof
+        if chosen is not None:
+            self.roof = chosen
+            self.roof_started = t
+        return chosen
+
+    def _roof_action(self, obs, me, roof, close_threat):
+        p = me["pos"]
+        x, y, top, xmin, ymin, xmax, ymax, ring, holes = roof
+        dx, dy = x - p[0], y - p[1]
+        d = math.hypot(dx, dy)
+        inside = self._inside(p[0], p[1], ring) and not any(self._inside(p[0], p[1], h) for h in holes)
+        # After landing, stop making footsteps and avoid revealing our position.
+        if inside and p[2] >= top - 1.5 and p[2] <= top + 2.5 and me.get("grounded", False):
+            if not close_threat:
+                return [0.0, 0.0], False, False, True
+            # Retreat toward the roof's central area instead of jumping into enemies.
+            return ([dx / d, dy / d] if d > 7 else [0.0, 0.0]), False, False, True
+        # Distance to the closest point of the building footprint's bounding box.
+        edge = math.hypot(p[0] - clamp(p[0], xmin, xmax), p[1] - clamp(p[1], ymin, ymax))
+        if edge > 11:
+            return [dx / d, dy / d] if d > .1 else [0.0, 0.0], False, False, True
+        # The vertical component must be actively solved; horizontal wall-sliding
+        # alone was the principal limitation of v1/v2 navigation.
+        if p[2] < top - .6 and me["energy"] > 13:
+            if me.get("grounded", False):
+                return [0.0, 0.0], False, True, True
+            return [dx / d, dy / d] if p[2] >= top - 4 and d > 2 else [0.0, 0.0], True, False, True
+        if d > 3:
+            # Keep jetting briefly if airborne beside the edge to avoid sliding
+            # down the wall before we reach the roof footprint.
+            jet = not inside and not me.get("grounded", False) and me["energy"] > 17
+            return [dx / d, dy / d], jet, False, True
+        return [0.0, 0.0], False, False, True
+
+    def act(self, obs):
+        # Retain the well-tested wrapper, schema, pickup and weapon handling,
+        # replacing the original risky navigation/combat policy below.
+        action = super().act(obs)
+        me, p, t = obs["self"], obs["self"]["pos"], obs["t"]
+        foes = [e for e in obs.get("mechs", []) if e.get("kind") == "mech"]
+        nearest = min((math.hypot(e["pos"][0] - p[0], e["pos"][1] - p[1]) for e in foes), default=1e9)
+        damaged = any(e.get("type") == "damaged" and e.get("weapon") != "zone" for e in obs.get("events", []))
+        if self.last_hp is not None and me["hp"] < self.last_hp - 1:
+            damaged = True
+        self.last_hp = me["hp"]
+        if damaged:
+            self.last_hp_hit = t
+        threatened = nearest < 75 or t - self.last_hp_hit < 2
+
+        # Healing requires 5 seconds without dealing OR taking damage. Do not
+        # fire at distant pursuers simply because they entered the vision cone.
+        # Only fire when an actual close-range defensive engagement is necessary.
+        if nearest > 32 or (not threatened and me["hp"] > me.get("max_hp", 1400) * .45):
+            action["fire"] = [False, False]
+        if foes and nearest < 100 and not any(action["fire"]):
+            e = min(foes, key=lambda e: dist2(e["pos"], p))
+            action["aim"] = [math.atan2(e["pos"][1] - p[1], e["pos"][0] - p[0]), 0.0]
+
+        # Determine rooftop anchor from the fixed public map, not hidden spawns.
+        roof = self._choose_roof(obs, me, foes)
+        if roof:
+            on_roof = (self._inside(p[0], p[1], roof[7]) and
+                       p[2] >= roof[2] - 1.5 and me.get("grounded", False))
+            if (self.roof_last_pos is not None and dist2(p, self.roof_last_pos) < .05
+                    and abs(p[2] - self.roof_last_pos[2]) < .05 and not on_roof):
+                self.roof_still += 1
+            else:
+                self.roof_still = 0
+            self.roof_last_pos = p[:]
+            if self.roof_still > 35 and t - self.roof_started > 3.5:
+                self.roof = None
+                self.roof_fail_until = t + 15
+                roof = None
+            else:
+                move, boost, jump, uses_roof = self._roof_action(obs, me, roof, threatened)
+                if uses_roof:
+                    action["move"], action["boost"], action["jump"] = move, boost, jump
+                    # Do not spend movement energy in safe cover; use it to escape later.
+                    return action
+        # Away from combat, avoid walking needlessly across the open map if
+        # safely deep inside the destination zone: preserve HP regeneration.
+        c, r = self._forecast(obs)
+        if not threatened and r > 90 and math.hypot(p[0]-c[0], p[1]-c[1]) < r * .56:
+            action["move"] = [0.0, 0.0]
+            action["boost"] = False
+        # If enemies are actively chasing, spend energy to create distance.
+        if threatened and nearest < 110 and me["energy"] > 26 and any(abs(v) > .2 for v in action["move"]):
+            action["boost"] = True
+        return action
+
+
+mechfight.run(RooftopBot)
