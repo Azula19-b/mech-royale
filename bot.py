@@ -78,10 +78,17 @@ class Bot:
                 continue
             if top <= p[2] or base >= p[2] + h:
                 continue
-            for k in (0.25, 0.5, 0.75, 1.0):
-                x, y = p[0] + (a-p[0])*k, p[1] + (b-p[1])*k
-                if self._inside(x, y, ring) and not any(self._inside(x, y, hole) for hole in holes):
-                    return True
+            dx, dy = a-p[0], b-p[1]
+            length = math.hypot(dx,dy) or 1.0
+            # Sweep the mech's radius as well as its centerline. Samples are
+            # dense enough to reject narrow walls and corner clipping.
+            nx, ny = -dy/length*2.35, dx/length*2.35
+            for k in (0.0, 0.2, 0.4, 0.6, 0.8, 1.0):
+                cx, cy = p[0] + dx*k, p[1] + dy*k
+                for ox, oy in ((0,0),(nx,ny),(-nx,-ny)):
+                    x,y=cx+ox,cy+oy
+                    if self._inside(x, y, ring) and not any(self._inside(x, y, hole) for hole in holes):
+                        return True
         return False
 
     def _future_zone(self, obs):
@@ -537,7 +544,7 @@ class RooftopBot(Bot):
     def act(self, obs):
         # Retain the well-tested wrapper, schema, pickup and weapon handling,
         # replacing the original risky navigation/combat policy below.
-        action = super().act(obs)
+        action = Bot.act(self, obs)
         me, p, t = obs["self"], obs["self"]["pos"], obs["t"]
         foes = [e for e in obs.get("mechs", []) if e.get("kind") == "mech"]
         nearest = min((math.hypot(e["pos"][0] - p[0], e["pos"][1] - p[1]) for e in foes), default=1e9)
@@ -591,4 +598,170 @@ class RooftopBot(Bot):
         return action
 
 
-mechfight.run(RooftopBot)
+class V4Bot(RooftopBot):
+    """Persistent tactical state machine; emergencies always outrank roof plans."""
+    name = "mech-survivor-v4"
+    STATES = ("EXPLORE", "REPOSITION", "CLIMB", "HIDE", "EVADE", "FIGHT", "ZONE_ESCAPE", "ENDGAME")
+
+    def __init__(self, hello):
+        super().__init__(hello)
+        self.state = "EXPLORE"
+        self.state_since = 0.0
+        self.last_transition = -1e9
+        self.climb_phase = "approach"
+        self.climb_started = -1e9
+        self.climb_phase_since = -1e9
+        self.evade_until = self.hide_until = -1e9
+        self.last_hp_v4 = None
+        self.last_pos_v4 = None
+        self.last_goal_v4 = None
+        self.movement_failures = 0
+
+    def _select_state(self, obs, me, threats, roof):
+        t, p = obs["t"], me["pos"]
+        center, radius = self._future_zone(obs)
+        radial = math.hypot(p[0]-center[0], p[1]-center[1])
+        if self.last_hp_v4 is not None and me["hp"] < self.last_hp_v4 - 1:
+            self.last_hp_hit = t
+        self.last_hp_v4 = me["hp"]
+        damaged = any(e.get("type") == "damaged" and e.get("weapon") != "zone" for e in obs.get("events", []))
+        if damaged:
+            self.last_hp_hit = t
+        mech_threats = [q for q in threats if q[0].get("kind") == "mech"]
+        nearest = min((q[1] for q in mech_threats), default=1e9)
+        attackers = [q for q in mech_threats if q[1] < 115 and q[4] > .35]
+        if len(attackers) >= 2 or (nearest < 42 and len(mech_threats) >= 2) or (damaged and nearest < 70):
+            self.evade_until = max(self.evade_until, t + 2.4)
+        if damaged and nearest > 65 and me["hp"] < me.get("max_hp",1400)*.75:
+            self.hide_until = max(self.hide_until, t + 5.0)
+        if (not me.get("in_zone",True) or radial > radius-12 or
+                (t > obs["zone"].get("shrink_start",1e9) and radial > radius*.88)):
+            desired = "ZONE_ESCAPE"
+        elif obs.get("alive",16) <= 4:
+            desired = "ENDGAME"
+        elif t < self.evade_until:
+            desired = "EVADE"
+        elif t < self.hide_until and self.damage_memory > 0:
+            desired = "HIDE"
+        elif nearest < 72 or (damaged and nearest < 105):
+            desired = "FIGHT"
+        elif self.climb_phase not in ("done","failed") and self.roof:
+            desired = "CLIMB"
+        elif roof and me.get("energy",0) > 48 and not attackers:
+            desired = "CLIMB"
+        elif len(mech_threats) >= 2 or nearest < 155:
+            desired = "REPOSITION"
+        elif obs.get("cubes") or obs.get("pickups"):
+            desired = "EXPLORE"
+        else:
+            desired = "REPOSITION"
+        # Short commitment prevents state chatter; emergencies bypass it.
+        if desired != self.state and desired not in ("ZONE_ESCAPE","EVADE","ENDGAME") and t-self.last_transition < .8:
+            desired = self.state
+        if desired != self.state:
+            self.state, self.state_since, self.last_transition = desired, t, t
+        return self.state, center, radius, nearest, attackers
+
+    def _climb(self, obs, me, roof):
+        p, t = me["pos"], obs["t"]
+        x,y,top,xmin,ymin,xmax,ymax,ring,holes = roof
+        d = math.hypot(x-p[0],y-p[1])
+        inside = self._inside(p[0],p[1],ring) and not any(self._inside(p[0],p[1],h) for h in holes)
+        landed = inside and p[2] >= top-1.4 and me.get("grounded",False)
+        if landed:
+            self.climb_phase = "done"
+            return [0,0],False,False
+        if self.climb_started < 0:
+            self.climb_started = self.climb_phase_since = t
+        if t-self.climb_started > 12:
+            self.climb_phase="failed"; self.roof=None; self.roof_fail_until=t+18
+            return None
+        if self.climb_phase == "approach":
+            edge=math.hypot(p[0]-clamp(p[0],xmin-5,xmax+5),p[1]-clamp(p[1],ymin-5,ymax+5))
+            if edge > 1.5:
+                return [(x-p[0])/max(d,1e-6),(y-p[1])/max(d,1e-6)],False,False
+            self.climb_phase="jump"; self.climb_phase_since=t
+        if self.climb_phase == "jump":
+            if me.get("grounded"):
+                self.climb_phase="jet"; self.climb_phase_since=t
+                return [0,0],False,True
+            self.climb_phase="jet"; self.climb_phase_since=t
+        if self.climb_phase == "jet":
+            if p[2] >= top+1:
+                self.climb_phase="land"; self.climb_phase_since=t
+            elif me.get("energy",0)<8 or t-self.climb_phase_since>4.2:
+                self.climb_phase="recover"; self.climb_phase_since=t
+            else:
+                return [clamp((x-p[0])/max(d,1),-1,1),clamp((y-p[1])/max(d,1),-1,1)],True,False
+        if self.climb_phase == "land":
+            if p[2]>top+.2:
+                return [clamp((x-p[0])/max(d,1),-1,1),clamp((y-p[1])/max(d,1),-1,1)],False,False
+            self.climb_phase="recover"; self.climb_phase_since=t
+        if self.climb_phase == "recover":
+            if me.get("grounded") and t-self.climb_phase_since>.8:
+                self.climb_phase="approach"; self.climb_started=t
+            return [clamp((x-p[0])/max(d,1),-1,1),clamp((y-p[1])/max(d,1),-1,1)],False,bool(me.get("grounded") and p[2]<top-5)
+        return None
+
+    def act(self, obs):
+        # Run shared targeting, protocol, pickup and aim logic; replace V3's
+        # final roof/standing-still movement arbitration below.
+        action = super().act(obs)
+        me,p,t=obs["self"],obs["self"]["pos"],obs["t"]
+        threats=self._threats(obs,me)
+        foes=[e for e in obs.get("mechs",[]) if e.get("kind")=="mech"]
+        roof=self._choose_roof(obs,me,foes)
+        state,center,radius,nearest,attackers=self._select_state(obs,me,threats,roof)
+        target=self._target(obs,me,foes,center,radius)
+        if state in ("ZONE_ESCAPE","EVADE"):
+            if state == "ZONE_ESCAPE":
+                dx,dy=center[0]-p[0],center[1]-p[1]; length=max(1,math.hypot(dx,dy))
+                target=[center[0]-dx/length*radius*.48,center[1]-dy/length*radius*.48]
+            else:
+                sx=sy=0.0
+                for e,d,ex,ey,danger in threats:
+                    if e.get("kind")=="mech": sx+=ex*danger/max(d,12); sy+=ey*danger/max(d,12)
+                angle=math.atan2(-sy,-sx) if abs(sx)+abs(sy)>1e-5 else t*1.7+self.slot
+                target=[p[0]+math.cos(angle)*85,p[1]+math.sin(angle)*85]
+            action["move"],action["boost"]=self._move(obs,me,threats,target)
+            action["boost"]=me.get("energy",0)>22
+            action["jump"]=bool(me.get("grounded") and state=="EVADE")
+        elif state == "HIDE":
+            cover=self._cover_target(me,threats,center,radius)
+            if cover: action["move"],action["boost"]=self._move(obs,me,threats,cover)
+            if nearest>75: action["fire"]=[False,False]
+        elif state == "FIGHT":
+            # Keep moving while defending; prioritize the weakest nearby attacker.
+            if foes:
+                target_enemy=min(foes,key=lambda e:(dist2(e["pos"],p),e.get("hp",1e9)))
+                target=[p[0]-(target_enemy["pos"][0]-p[0]),p[1]-(target_enemy["pos"][1]-p[1])]
+            action["move"],action["boost"]=self._move(obs,me,threats,target)
+            if nearest<125:
+                action["aim"],action["fire"],_=self._aim_and_fire(obs,me,threats)
+        elif state == "CLIMB" and roof:
+            if self.climb_phase in ("done","failed"):
+                self.climb_phase="approach"; self.climb_started=t
+            cmd=self._climb(obs,me,roof)
+            if cmd is not None: action["move"],action["boost"],action["jump"]=cmd
+            if nearest<80:
+                action["move"],action["boost"]=self._move(obs,me,threats,target)
+        elif state in ("EXPLORE","REPOSITION","ENDGAME"):
+            action["move"],action["boost"]=self._move(obs,me,threats,target)
+            if state=="ENDGAME" and foes and nearest<130:
+                action["fire"]=self._aim_and_fire(obs,me,threats)[1]
+        # Movement failure recovery detects blocked/stalled commands over time.
+        if self.last_pos_v4 is not None:
+            delta=math.hypot(p[0]-self.last_pos_v4[0],p[1]-self.last_pos_v4[1])
+            if delta<.08 and self.last_goal_v4 and math.hypot(*me.get("vel",[0,0])[:2])<1 and math.hypot(self.last_goal_v4[0]-p[0],self.last_goal_v4[1]-p[1])>8:
+                self.movement_failures+=1
+            else: self.movement_failures=max(0,self.movement_failures-1)
+        self.last_pos_v4=p[:]; self.last_goal_v4=target[:]
+        if self.movement_failures>=5 and state not in ("ZONE_ESCAPE","EVADE"):
+            angle=math.atan2(target[1]-p[1],target[0]-p[0])+math.pi/2*((obs["tick"]//20+self.slot)%2*2-1)
+            action["move"],action["boost"],action["jump"]=[math.cos(angle),math.sin(angle)],me["energy"]>25,bool(me.get("grounded"))
+            self.movement_failures=0
+        action["tick"]=obs["tick"]
+        return action
+
+
+mechfight.run(V4Bot)

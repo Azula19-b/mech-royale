@@ -94,6 +94,51 @@ class ControllerRegression(unittest.TestCase):
         _, fire, _ = self.b._aim_and_fire(self.obs,self.me,[])
         self.assertFalse(fire[0])
 
+    def test_v4_group_pressure_enters_evade_and_keeps_moving(self):
+        b = bot.V4Bot(self.hello)
+        self.obs["mechs"] = [self.enemy(24), {**self.enemy(-28), "id": 77}]
+        action = b.act(self.obs)
+        self.assertEqual(b.state, "EVADE")
+        self.assertGreater(sum(v*v for v in action["move"]), .5)
+        self.assertTrue(action["boost"])
+
+    def test_v4_zone_escape_overrides_climb_and_combat(self):
+        b = bot.V4Bot(self.hello)
+        b.roof = (20,0,15,15,-5,25,5,[15,-5,25,-5,25,5,15,5],[])
+        b.climb_phase = "jet"
+        self.me["pos"] = [490,0,0]
+        self.obs["zone"] = {"center":[0,0],"radius":500,"next_center":[0,0],"next_radius":500,"shrink_start":0,"shrink_end":10}
+        self.me["in_zone"] = False
+        action = b.act(self.obs)
+        self.assertEqual(b.state, "ZONE_ESCAPE")
+        self.assertFalse(action["boost"] is False)
+        self.assertLess(action["move"][0], 0)
+
+    def test_v4_climb_uses_jump_jet_land_phases(self):
+        b = bot.V4Bot(self.hello)
+        roof = (0,0,12,-8,-8,8,8,[-8,-8,8,-8,8,8,-8,8],[])
+        self.me["pos"] = [0,0,0]
+        self.me["grounded"] = True
+        b.climb_started = 0
+        self.obs["t"] = 1
+        self.assertEqual(b._climb(self.obs,self.me,roof)[2], True)
+        self.assertEqual(b.climb_phase,"jet")
+        self.me["grounded"] = False
+        self.me["pos"] = [0,0,13]
+        self.assertEqual(b._climb(self.obs,self.me,roof)[1], False)
+        self.assertEqual(b.climb_phase,"land")
+        self.me["pos"] = [0,0,12]
+        self.me["grounded"] = True
+        b._climb(self.obs,self.me,roof)
+        self.assertEqual(b.climb_phase,"done")
+
+    def test_v4_hysteresis_holds_non_emergency_state(self):
+        b = bot.V4Bot(self.hello)
+        b.state = "REPOSITION"
+        b.last_transition = 4.9
+        self.obs["t"] = 5.0
+        self.assertEqual(b._select_state(self.obs,self.me,[],None)[0],"REPOSITION")
+
 
 if __name__ == "__main__":
     unittest.main()
