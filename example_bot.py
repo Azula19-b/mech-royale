@@ -6,6 +6,25 @@ from arena import Arena
 from combat import intercept
 
 
+V6A_ENABLED = True
+EARLY_PHASE_S = 120
+ISOLATED_RANGE_M = 90
+RECENT_ENEMY_RANGE_M = 150
+RECENT_ENEMY_S = 3
+ENGAGE_MIN_HP_FRAC = 0.6
+UNKNOWN_ENEMY_MIN_HP_FRAC = 0.8
+MIN_ENGAGE_S = 2
+COMBAT_MAX_ZONE_URGENCY = 0.35
+DISENGAGE_HP_FRAC = 0.4
+DISENGAGE_ENERGY_FRAC = 0.25
+ESCAPE_PROBE_M = 10
+ESCAPE_SIDE_ANGLE = math.pi / 3
+MIN_ESCAPE_ROUTES = 2
+FINISH_HP_FRAC = 0.35
+FINISH_MAX_S = 3
+FINISH_MAX_M = 25
+
+
 def wrap(yaw):
     return (yaw + math.pi) % math.tau - math.pi
 
@@ -33,6 +52,13 @@ class Bot:
         self.attack_bearing = None
         self.attack_until = -1
         self.last_damage = -math.inf
+        if V6A_ENABLED:
+            self.recent_enemies = {}
+            self.engaged_id = None
+            self.engaged_since = -math.inf
+            self.finish_id = None
+            self.finish_start = None
+            self.finish_spent = False
 
     def threat_values(self, me, enemy):
         dx, dy = (b - a for a, b in zip(me["pos"][:2], enemy["pos"][:2]))
@@ -135,9 +161,105 @@ class Bot:
             nearest = max(nearest, risk)
         return score - 0.8 * pressure - 0.65 * nearest
 
-    def movement(self, obs, enemies, loot_goal=None):
+    def engagement_target(self, obs, enemies, urgency):
+        me, now = obs["self"], obs["t"]
+        if now >= EARLY_PHASE_S:
+            self.engaged_id = None
+            return None
+
+        nearby = []
+        self.recent_enemies = {
+            identifier: seen for identifier, seen in self.recent_enemies.items()
+            if now - seen <= RECENT_ENEMY_S
+        }
+        for enemy in enemies:
+            distance = math.dist(me["pos"], enemy["pos"])
+            if distance <= RECENT_ENEMY_RANGE_M:
+                # The protocol does not distinguish live sight from built-in memory.
+                self.recent_enemies[enemy["id"]] = now
+            if distance <= ISOLATED_RANGE_M:
+                nearby.append((enemy, distance))
+
+        if (len(nearby) != 1 or len(self.recent_enemies) != 1
+                or not me["in_zone"] or urgency >= COMBAT_MAX_ZONE_URGENCY
+                or me["hp"] < DISENGAGE_HP_FRAC * me["max_hp"]
+                or me["energy"] < DISENGAGE_ENERGY_FRAC * me["max_energy"]):
+            self.engaged_id = None
+            return None
+
+        enemy, distance = nearby[0]
+        escapes = self.escape_routes(me, enemy)
+        if len(escapes) < MIN_ESCAPE_ROUTES:
+            self.engaged_id = None
+            return None
+        if self.engaged_id == enemy["id"] and now - self.engaged_since < MIN_ENGAGE_S:
+            return enemy
+        if not self.can_engage(me, enemy, distance):
+            self.engaged_id = None
+            return None
+        if self.engaged_id != enemy["id"]:
+            self.engaged_id = enemy["id"]
+            self.engaged_since = now
+            if self.finish_id != enemy["id"]:
+                self.finish_id = enemy["id"]
+                self.finish_start = None
+                self.finish_spent = False
+        return enemy
+
+    def escape_routes(self, me, enemy):
+        pos, stats = me["pos"], me["stats"]
+        away = bearing(enemy["pos"], pos)
+        routes = []
+        for offset in (-ESCAPE_SIDE_ANGLE, 0, ESCAPE_SIDE_ANGLE):
+            dx, dy = direction(away + offset)
+            distance, height = self.arena.walk(pos, dx, dy, ESCAPE_PROBE_M, stats)
+            end = (pos[0] + dx * distance, pos[1] + dy * distance, height)
+            if distance >= ESCAPE_PROBE_M and self.arena.edge(*end[:2]) >= stats["radius"]:
+                routes.append(end)
+        return routes
+
+    def can_engage(self, me, enemy, distance):
+        hp = enemy.get("hp")
+        minimum = UNKNOWN_ENEMY_MIN_HP_FRAC if hp is None else ENGAGE_MIN_HP_FRAC
+        if me["hp"] < minimum * me["max_hp"] or (hp is not None and me["hp"] < hp):
+            return False
+
+        # Use boost speed as a conservative ground approach estimate.
+        contact = max(0, distance - 2 * me["stats"]["radius"])
+        reach_time = contact / max(self.config["mech"]["boost_speed"], math.hypot(*enemy["vel"]))
+        return any(weapon and weapon["kind"] == "gun"
+                   and (weapon.get("ammo", 0) > 0 or 0 < weapon.get("reload", 0) < reach_time)
+                   for weapon in me["weapons"])
+
+    def finish_move(self, obs, enemy):
+        if self.finish_spent:
+            return None
+        me, now = obs["self"], obs["t"]
+        pos, stats = me["pos"], me["stats"]
+        hp, maximum = enemy.get("hp"), enemy.get("max_hp")
+        distance = math.dist(pos, enemy["pos"])
+        yaw = bearing(pos, enemy["pos"])
+        move = direction(yaw)
+        step = max(stats["walk_speed"], math.hypot(*me["vel"][:2])) * self.period
+        started, origin = self.finish_start if self.finish_start else (now, pos[:2])
+        if (hp is not None and maximum is not None and hp < FINISH_HP_FRAC * maximum
+                and self.can_engage(me, enemy, distance) and me["grounded"]
+                and distance > 2 * stats["radius"] + step
+                and now + self.period - started <= FINISH_MAX_S
+                and math.dist(origin, pos[:2]) + step <= FINISH_MAX_M
+                and self.arena.walk(pos, *move, step, stats)[0] >= step
+                and self.exposed(me, [enemy], pos)
+                and any(not self.exposed(me, [enemy], end) for end in self.escape_routes(me, enemy))):
+            self.finish_start = started, origin
+            self.heading = yaw
+            return list(move), False
+        if self.finish_start:
+            self.finish_spent = True
+        return None
+
+    def movement(self, obs, enemies, loot_goal=None, zone_goal=None):
         me = obs["self"]
-        goal_yaw, urgency = self.zone_goal(obs)
+        goal_yaw, urgency = self.zone_goal(obs) if zone_goal is None else zone_goal
         if loot_goal is not None and urgency < 0.35:
             if math.dist(me["pos"][:2], loot_goal) < 2:
                 return [0.0, 0.0], False
@@ -237,18 +359,19 @@ class Bot:
         tolerance = math.atan2(self.config["mech"]["radius"] * 0.7, max(1, distance))
         return aim, error < tolerance and abs(aim[1] - me["aim"][1]) < tolerance
 
-    def defense(self, obs, enemies, armor, act):
+    def defense(self, obs, enemies, armor, act, engagement=None):
         me = obs["self"]
         if not enemies:
             return
-        target = enemies[0]
+        target = engagement if engagement is not None else enemies[0]
         distance = math.dist(me["pos"], target["pos"])
         wounded = me["hp"] < 0.85 * me["max_hp"]
         recovering = obs["t"] - self.last_damage >= me["stats"]["regen_delay"] * 0.55
         dx, dy = act["move"]
         x, y, z = me["pos"]
         behind_cover_soon = wounded and not self.exposed(me, enemies, (x + 10 * dx, y + 10 * dy, z))
-        if distance > 105 or (wounded and (recovering or behind_cover_soon) and distance > 32):
+        if engagement is None and (distance > 105 or (
+                wounded and (recovering or behind_cover_soon) and distance > 32)):
             return
         choices = []
         for slot, weapon in enumerate(me["weapons"]):
@@ -256,7 +379,8 @@ class Bot:
                 continue
             kind, w = weapon["kind"], weapon["stats"]
             if kind in ("gun", "mortar"):
-                if weapon["cooldown"] > 0.35 or weapon.get("reload", 0):
+                tracking_gun = engagement is not None and kind == "gun"
+                if not tracking_gun and (weapon["cooldown"] > 0.35 or weapon.get("reload", 0)):
                     continue
                 shot = self.projectile_shot(me, target, weapon, armor, w.get("gravity", 0))
                 if shot:
@@ -311,8 +435,14 @@ class Bot:
         if any(event["type"] in ("damaged", "hit") for event in obs["events"]):
             self.last_damage = obs["t"]
         enemies = self.threats(obs)
-        move, boost = self.movement(obs, enemies, self.loot_goal(obs, enemies))
-        yaw = self.armor_yaw(obs, enemies, math.atan2(move[1], move[0]))
+        zone_goal = self.zone_goal(obs) if V6A_ENABLED and obs["t"] < EARLY_PHASE_S else None
+        engagement = self.engagement_target(obs, enemies, zone_goal[1]) if zone_goal else None
+        pursuit = self.finish_move(obs, engagement) if engagement is not None else None
+        if V6A_ENABLED and engagement is None and self.finish_start is not None:
+            self.finish_spent = True
+        move, boost = pursuit or self.movement(obs, enemies, self.loot_goal(obs, enemies), zone_goal)
+        armor_threats = [engagement] if engagement is not None else enemies
+        yaw = self.armor_yaw(obs, armor_threats, math.atan2(move[1], move[0]))
         act = {"tick": obs["tick"], "move": move, "boost": boost, "aim": [yaw, 0.0]}
         if obs["offer"]:
             priority = ("servos", "nanites", "armor", "plating", "reactor", "jets", "capacitor", "gyros", "sensors")
@@ -327,7 +457,7 @@ class Bot:
                 if math.hypot(px - x, py - y) <= self.reach and abs(pz - z) <= 4 and item["kind"] not in held:
                     act["take"] = item["id"]
                     break
-        self.defense(obs, enemies, yaw, act)
+        self.defense(obs, enemies, yaw, act, engagement)
         return act
 
 

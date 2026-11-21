@@ -228,3 +228,145 @@ mf.run(Pilot)
             process.stdin.write('{"type":"end"}\n')
             process.stdin.close()
             self.assertEqual(process.wait(timeout=3), 0)
+
+    def test_isolated_hunter_engagement_and_recent_backup(self):
+        self.bot.arena.clear = lambda *args, **kwargs: True
+        hunter = enemy(55, 0)
+        hunter["hp"] = 900
+        self.obs["self"]["hp"] = 1100
+        self.obs["mechs"] = [hunter]
+        self.assertIn("fire", self.bot.act(self.obs))
+        hunter["hp"] = 1200
+        self.obs["t"] = 2
+        self.assertIn("fire", self.bot.act(self.obs))
+        hunter["hp"] = 900
+        self.obs["mechs"].append(enemy(125, 0, identifier=2))
+        self.assertNotIn("fire", self.bot.act(self.obs))
+        self.obs["mechs"].pop()
+        self.obs["t"] = 4
+        self.assertNotIn("fire", self.bot.act(self.obs))
+        self.obs["t"] = 6
+        self.assertIn("fire", self.bot.act(self.obs))
+
+    def test_isolated_hunter_requires_health_and_reload_time(self):
+        hunter = enemy(45, 0, -25)
+        del hunter["hp"]
+        self.obs["self"]["hp"] = 1100
+        self.assertIsNone(self.bot.engagement_target(self.obs, [hunter], 0))
+        self.obs["self"]["hp"] = 1200
+        gun = self.obs["self"]["weapons"][0]
+        del gun["ammo"], gun["reload"]
+        self.assertIsNone(self.bot.engagement_target(self.obs, [hunter], 0))
+        gun.update(ammo=0, reload=2)
+        self.assertIsNone(self.bot.engagement_target(self.obs, [hunter], 0))
+        gun["reload"] = 1
+        self.assertIs(self.bot.engagement_target(self.obs, [hunter], 0), hunter)
+
+    def test_engaged_gun_leads_through_reload_and_respects_cover(self):
+        self.bot.arena.clear = lambda *args, **kwargs: True
+        self.obs["mechs"] = [enemy(65, 0, 0, 10)]
+        self.obs["self"]["weapons"][0].update(ammo=0, reload=1)
+        act = self.bot.act(self.obs)
+        self.assertGreater(act["aim"][0], 0.025)
+        self.assertEqual(act["fire"], [False, False])
+        self.assertGreater(math.hypot(*act["move"]), 0.9)
+        self.bot.arena.clear = lambda *args, **kwargs: False
+        self.assertNotIn("fire", self.bot.act(self.obs))
+
+    def test_flag_off_replays_v5_action_bytes(self):
+        import subprocess
+        import sys
+
+        module_dir = Path(__file__).resolve().parent
+        original = subprocess.check_output(
+            ["git", "show", "990f4a2181b25adc653291d0620cd755cb01301a:example_bot.py"],
+            cwd=module_dir,
+        ).decode()
+        with gzip.open(KIT / "check/stream.jsonl.gz", "rb") as stream:
+            stream.readline()
+            inputs = [json.dumps(hello()).encode() + b"\n", *stream]
+
+        def replay(code):
+            with subprocess.Popen([sys.executable, "-B", "-u", "-c", code], cwd=module_dir,
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE) as process:
+                actions = []
+                for line in inputs:
+                    process.stdin.write(line)
+                    process.stdin.flush()
+                    kind = json.loads(line)["type"]
+                    if kind == "hello":
+                        self.assertEqual(json.loads(process.stdout.readline())["type"], "ready")
+                    elif kind == "obs":
+                        actions.append(process.stdout.readline())
+                process.stdin.close()
+                self.assertEqual(process.wait(timeout=5), 0)
+                self.assertEqual(process.stderr.read(), b"")
+            self.assertEqual(len(actions), 300)
+            self.assertTrue(all(actions))
+            return actions
+
+        v5 = replay(original)
+        disabled = replay("import example_bot as bot; bot.V6A_ENABLED = False; bot.mf.run(bot.Bot)")
+        self.assertEqual(v5, disabled)
+
+    def test_finish_requires_cover_and_respects_time_and_distance_caps(self):
+        hunter = enemy(55, 0)
+        hunter["hp"] = 350
+        self.obs["mechs"] = [hunter]
+        self.bot.arena.clear = lambda *args, **kwargs: True
+        self.bot.act(self.obs)
+        self.assertIsNone(self.bot.finish_start)
+
+        self.bot.exposed = lambda me, enemies, pos: abs(pos[1]) < 5
+        act = self.bot.act(self.obs)
+        self.assertEqual(act["move"], [1, 0])
+        self.assertFalse(act["boost"])
+        self.obs["self"]["pos"][0] = 24
+        self.assertIsNone(self.bot.finish_move(self.obs, hunter))
+        self.assertTrue(self.bot.finish_spent)
+
+        self.bot.finish_spent = False
+        self.obs["self"]["pos"][0] = 0
+        self.obs["t"] += 3
+        self.assertIsNone(self.bot.finish_move(self.obs, hunter))
+        self.assertTrue(self.bot.finish_spent)
+
+    def test_zone_or_second_attacker_interrupts_finish(self):
+        hunter = enemy(55, 0)
+        hunter["hp"] = 350
+        self.obs["mechs"] = [hunter]
+        self.bot.exposed = lambda me, enemies, pos: abs(pos[1]) < 5
+        self.assertEqual(self.bot.act(self.obs)["move"], [1, 0])
+        self.obs["t"] += self.bot.period
+        self.obs["zone"].update(next_center=[0, 140], next_radius=12, shrink_end=5)
+        from copy import copy
+        from unittest.mock import patch
+
+        v5 = copy(self.bot)
+        with patch("example_bot.V6A_ENABLED", False):
+            expected = v5.act(self.obs)
+        self.assertEqual(self.bot.act(self.obs), expected)
+        self.assertIsNone(self.bot.engaged_id)
+        self.assertTrue(self.bot.finish_spent)
+
+        self.obs["zone"] = observation(self.message["config"])["zone"]
+        self.obs["mechs"].append(enemy(55, 15, identifier=2))
+        self.bot.act(self.obs)
+        self.assertIsNone(self.bot.engaged_id)
+
+    def test_disengage_during_minimum_hold_when_hurt_drained_or_cornered(self):
+        hunter = enemy(55, 0)
+        hunter["hp"] = 350
+        self.obs["mechs"] = [hunter]
+        me = self.obs["self"]
+        for field, low in (("hp", 500), ("energy", 20)):
+            with self.subTest(field=field):
+                self.assertIs(self.bot.engagement_target(self.obs, [hunter], 0), hunter)
+                original = me[field]
+                me[field] = low
+                self.assertIsNone(self.bot.engagement_target(self.obs, [hunter], 0))
+                me[field] = original
+        self.assertIs(self.bot.engagement_target(self.obs, [hunter], 0), hunter)
+        self.bot.arena.walk = lambda start, dx, dy, distance, stats: (0, start[2])
+        self.assertIsNone(self.bot.engagement_target(self.obs, [hunter], 0))
