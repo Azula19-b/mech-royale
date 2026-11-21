@@ -29,6 +29,7 @@ SCENARIOS = {
     "pursuit": ((-70, 55), [(0, -60)], (0, 0), 135, 135),
     "pincer": ((0, 65), [(-55, -15), (55, -15), (0, 100)], (0, 35), 105, 105),
     "cover": ((-22, 0), [(-50, 27), (-75, -12)], (0, 0), 120, 100),
+    "wounded_cover": ((18, 45), [(-45, 45)], (0, 0), 150, 140),
     "evacuation": ((-90, 0), [(-145, -24)], (45, 0), 150, 24),
     "edge": ((-135, 105), [(-95, 0), (25, -50)], (0, 0), 155, 95),
     "squad": ((0, 66), [(-70, -25), (-80, 0), (-83, 26), (-85, 52), (-77, 72),
@@ -67,6 +68,10 @@ class Scenario:
         self.obs["mechs"] = [enemy(x, y, identifier=i) for i, (x, y) in enumerate(attackers, 1)]
         self.obs["zone"].update(center=list(center), next_center=list(center), radius=large,
                                 next_radius=small, shrink_start=4, shrink_end=15)
+        if name == "wounded_cover":
+            self.obs["self"]["hp"] = 900
+            self.obs["mechs"][0]["vel"] = [4, 0, 0]
+            self.obs["zone"].update(shrink_start=60, shrink_end=110)
         self.large = large
         self.last_damage = self.last_spend = self.last_shot = -10
         self.stall = 0
@@ -177,6 +182,8 @@ class Scenario:
             me["hp"] = min(me["max_hp"], me["hp"] + stats["regen_per_s"] / 10)
         if me["hp"] <= 0:
             # Keep the deterministic stream alive and record losses separately.
+            if not m["hp_resets"]:
+                m["first_loss_seconds"] = round(now - 0.9, 2)
             m["hp_resets"] += 1
             me["hp"] = me["max_hp"]
         obs["tick"] += 2
@@ -272,6 +279,9 @@ def main():
             scenario = Scenario(name, arena, message["config"])
             sample = run(command, message, schema, scenario, args.steps)
             times.extend(sample)
+            scenario.metrics["hp_remaining"] = scenario.obs["self"]["hp"]
+            scenario.metrics["resources_gained"] = scenario.obs["self"]["cubes"]
+            scenario.metrics.setdefault("first_loss_seconds", args.steps / 10)
             metrics = " ".join(f"{key}={value:.1f}" if isinstance(value, float) else f"{key}={value}"
                                for key, value in sorted(scenario.metrics.items()))
             print(f"{name}: {summary(sample)} {metrics}", file=sys.stderr)

@@ -4,6 +4,9 @@ import math
 import mechfight as mf
 from arena import Arena
 from combat import intercept
+from cover import Cover
+
+V7B_ENABLED = True
 
 
 def wrap(yaw):
@@ -25,6 +28,7 @@ class Bot:
         self.config = hello["config"]
         self.arena = Arena(hello["map"]["dir"])
         self.arena.build_navigation(self.config["mech"])
+        self.cover = Cover(self.arena, self.config["mech"], self.config) if V7B_ENABLED else None
         self.waypoint = None
         self.waypoint_until = -1
         self.reach = self.config["loot"]["pickup_radius"]
@@ -311,7 +315,15 @@ class Bot:
         if any(event["type"] in ("damaged", "hit") for event in obs["events"]):
             self.last_damage = obs["t"]
         enemies = self.threats(obs)
-        move, boost = self.movement(obs, enemies, self.loot_goal(obs, enemies))
+        planned = self.cover.command(obs, enemies, self.arena.waypoint) if self.cover is not None else None
+        if planned is None:
+            move, boost = self.movement(obs, enemies, self.loot_goal(obs, enemies))
+        else:
+            move, boost = planned
+            if move != [0.0, 0.0]:
+                self.heading = math.atan2(move[1], move[0])
+        if self.cover is not None:
+            self.cover.was_moving = math.hypot(*move) > 0.5
         yaw = self.armor_yaw(obs, enemies, math.atan2(move[1], move[0]))
         act = {"tick": obs["tick"], "move": move, "boost": boost, "aim": [yaw, 0.0]}
         if obs["offer"]:
@@ -327,7 +339,9 @@ class Bot:
                 if math.hypot(px - x, py - y) <= self.reach and abs(pz - z) <= 4 and item["kind"] not in held:
                     act["take"] = item["id"]
                     break
-        self.defense(obs, enemies, yaw, act)
+        if planned is None or (move != [0.0, 0.0] and me["in_zone"]
+                               and me["hp"] >= 0.96 * me["max_hp"] and not boost):
+            self.defense(obs, enemies, yaw, act)
         return act
 
 
