@@ -63,7 +63,8 @@ class Intelligence:
             dx, dy = x - eye[0], y - eye[1]
             yaw = math.atan2(dy, dx)
             distance = math.hypot(dx, dy)
-            center = (x, y, z + base["height"] / 2)
+            size = 1 + self.config["cubes"]["size_per_cube"] * actor.get("cubes", 0)
+            center = (x, y, z + base["height"] * size / 2)
             covered = not self.arena.clear(eye, center, spacing=3)
             near = distance <= vision["near_range"] + stats.get("near_range_bonus", 0)
             in_view = (distance <= vision["range"] + stats.get("vision_bonus", 0)

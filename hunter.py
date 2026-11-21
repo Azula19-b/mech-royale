@@ -62,9 +62,10 @@ class Bot(Baseline):
         penalty = max(0, stats["rear_mult"] - 1) * (1 - stats["armor"])
         self.lanes = [(bearing(me["pos"], t.actor["pos"]), pressure_weight(t, t.distance) * penalty)
                       for t in tracks if not t.covered]
+        reference_damage = self.config["weapons"]["gun"]["damage"]
         for event in obs["events"]:
             if event["type"] == "damaged" and event["bearing"] is not None:
-                self.lanes.append((event["bearing"], event["amount"] / 45 * penalty))
+                self.lanes.append((event["bearing"], event["amount"] / reference_damage * penalty))
         actual = me["aim"][0]
         options = [actual]
         for yaw, _ in self.lanes:

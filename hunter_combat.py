@@ -31,7 +31,7 @@ class FireControl:
         offset = stats["radius"] + 0.5
         origin = (*me["pos"][:2], me["pos"][2] + (stats["height"] + 0.5 if gravity else stats["muzzle_height"]))
         cubes = bot.config["cubes"]
-        size = 1 + cubes["size_per_cube"] * min(track.actor.get("cubes", 0), cubes["stat_cap"])
+        size = 1 + cubes["size_per_cube"] * track.actor.get("cubes", 0)
         radius = base["radius"] * size
         delay = 1 / bot.config["match"]["tick_hz"]
         x, y, z = track.predict(delay)
