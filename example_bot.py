@@ -5,6 +5,13 @@ import mechfight as mf
 from arena import Arena
 from combat import intercept
 
+V7A_ENABLED = True
+OPENING_SECONDS = 38
+MIN_RESOURCE_HP = 0.90
+CUBE_TARGET = 3
+HUNTER_BUFFER = 135
+SHOT_BUFFER = 200
+
 
 def wrap(yaw):
     return (yaw + math.pi) % math.tau - math.pi
@@ -33,6 +40,9 @@ class Bot:
         self.attack_bearing = None
         self.attack_until = -1
         self.last_damage = -math.inf
+        self.last_incoming = -math.inf
+        self.crate_attempt = None
+        self.failed_crates = set()
 
     def threat_values(self, me, enemy):
         dx, dy = (b - a for a, b in zip(me["pos"][:2], enemy["pos"][:2]))
@@ -173,12 +183,13 @@ class Bot:
         viable = self.arena.walk(pos, *move, 14, me["stats"])[0] >= 12
         return list(move), me["grounded"] and viable and me["energy"] > 1 and (emergency or escape)
 
-    def projectile_shot(self, me, target, weapon, armor, gravity=0):
+    def projectile_shot(self, me, target, weapon, armor, gravity=0, target_height=None):
         stats = me["stats"]
         offset = stats["radius"] + 0.5
         height = stats["height"] + 0.5 if gravity else stats["muzzle_height"]
         origin = (*me["pos"][:2], me["pos"][2] + height)
-        target_height = self.config["mech"]["height"] * (1 + self.config["cubes"]["size_per_cube"] * target.get("cubes", 0))
+        if target_height is None:
+            target_height = self.config["mech"]["height"] * (1 + self.config["cubes"]["size_per_cube"] * target.get("cubes", 0))
         position = (*target["pos"][:2], target["pos"][2] + target_height * 0.53)
         w = weapon["stats"]
         solution = intercept(origin, position, target["vel"], w["speed"], offset, gravity)
@@ -305,21 +316,126 @@ class Bot:
                 return point[:2]
         return None
 
+    def opening_resource(self, obs, enemies):
+        me, zone = obs["self"], obs["zone"]
+        pos, stats = me["pos"], me["stats"]
+        if (obs["t"] >= OPENING_SECONDS or not me["in_zone"] or not me["grounded"]
+                or me["hp"] < MIN_RESOURCE_HP * me["max_hp"]
+                or obs["t"] - self.last_incoming < stats["regen_delay"]
+                or obs["projectiles"]
+                or any(s["dist"] == "near" and s["kind"] != "drop" for s in obs["sounds"])):
+            return None
+        hunters = [(e["pos"][:2], tuple(p + 3 * v for p, v in zip(e["pos"][:2], e["vel"][:2])))
+                   for e in enemies]
+        if any(math.dist(pos[:2], predicted) < HUNTER_BUFFER for pair in hunters for predicted in pair):
+            return None
+        if any(e["kind"] == "npc" and math.dist(pos, e["pos"]) < self.config["npc"]["aggro_range"] + 20
+               for e in obs["mechs"]):
+            return None
+
+        held = {w["kind"] for w in me["weapons"] if w}
+        preference = {"lightning": 0, "mortar": 1, "laser": 2, "gun": 3}
+        candidates = []
+        if None in me["weapons"]:
+            candidates.extend((p, "take", 14, preference[p["kind"]] * 0.35)
+                              for p in obs["pickups"] if p["kind"] not in held)
+        if me["cubes"] < CUBE_TARGET:
+            candidates.extend((c, "cube", 16, 0.4 if me["cubes"] == 0 else 0.9) for c in obs["cubes"])
+        if (me["cubes"] < CUBE_TARGET and (self.crate_attempt is not None or obs["t"] - self.last_damage >= stats["regen_delay"])
+                and not any(math.dist(pos[:2], point) < SHOT_BUFFER for pair in hunters for point in pair)
+                and not any(s["kind"] in ("gun", "mortar", "laser", "lightning", "explosion")
+                            for s in obs["sounds"])):
+            candidates.extend((c, "crate", 22, 2.2 + 0.4 * me["cubes"]) for c in obs.get("crates", ()))
+
+        gun = me["weapons"][0]
+        choices = []
+        for item, kind, limit, cost in candidates:
+            point = item["pos"]
+            distance = math.dist(pos[:2], point[:2])
+            if (distance > limit or abs(point[2] - pos[2]) > 3
+                    or math.dist(point[:2], zone["center"]) > zone["radius"] - 25
+                    or math.dist(point[:2], zone["next_center"]) > zone["next_radius"] - 15
+                    or any(math.dist(point[:2], predicted) < HUNTER_BUFFER
+                           for pair in hunters for predicted in pair)):
+                continue
+            yaw = bearing(pos, point)
+            dx, dy = direction(yaw)
+            if self.arena.walk(pos, dx, dy, distance, stats)[0] < distance:
+                continue
+            exits = sum(self.arena.walk(point, *direction(yaw + i * math.pi / 2), 10, stats)[0] >= 9
+                        for i in range(4))
+            if exits < 2:
+                continue
+            shot = None
+            eta = distance / stats["walk_speed"]
+            if kind == "crate":
+                if (item["id"] in self.failed_crates or not gun or gun["kind"] != "gun"
+                        or gun.get("reload") or not 7 <= distance):
+                    continue
+                shots = math.ceil(item["hp"] / gun["stats"]["damage"])
+                if gun["ammo"] < shots:
+                    continue
+                target = dict(item, vel=(0, 0, 0))
+                shot = self.projectile_shot(me, target, gun, yaw, target_height=self.config["crates"]["height"])
+                if shot is None:
+                    continue
+                eta += shots * (gun["stats"]["cooldown"] + self.period) + 0.7
+            if obs["t"] + eta >= min(OPENING_SECONDS, zone["shrink_end"] - 12):
+                continue
+            choices.append((eta + cost, item["id"], kind, point, shot))
+
+        return min(choices, default=None)
+
+    def resource_action(self, obs, choice):
+        _, item_id, kind, point, shot = choice
+        me = obs["self"]
+        distance = math.dist(me["pos"][:2], point[:2])
+        yaw = bearing(me["pos"], point)
+        action = {"tick": obs["tick"], "move": list(direction(yaw)), "boost": False, "aim": [yaw, 0.0]}
+        if kind == "crate":
+            if self.crate_attempt is None or self.crate_attempt[0] != item_id:
+                self.crate_attempt = (item_id, obs["t"])
+            if obs["t"] - self.crate_attempt[1] > 4:
+                self.failed_crates.add(item_id)
+                return None
+            action.update(move=[0.0, 0.0], aim=list(shot[0]), fire=[shot[1], False])
+        elif kind == "take" and distance <= self.reach:
+            action.update(move=[0.0, 0.0], take=item_id)
+        return action
+
     def act(self, obs: mf.Observation) -> mf.Action:
         me = obs["self"]
         x, y, z = me["pos"]
         if any(event["type"] in ("damaged", "hit") for event in obs["events"]):
             self.last_damage = obs["t"]
         enemies = self.threats(obs)
-        move, boost = self.movement(obs, enemies, self.loot_goal(obs, enemies))
+        resource = None
+        if V7A_ENABLED:
+            if any(e["type"] == "damaged" for e in obs["events"]):
+                self.last_incoming = obs["t"]
+            choice = self.opening_resource(obs, enemies)
+            if choice is not None:
+                resource = self.resource_action(obs, choice)
+            if choice is None or choice[2] != "crate":
+                self.crate_attempt = None
+        if resource is None:
+            loot = self.loot_goal(obs, enemies) if not V7A_ENABLED else None
+            move, boost = self.movement(obs, enemies, loot)
+        else:
+            move, boost = resource["move"], resource["boost"]
         yaw = self.armor_yaw(obs, enemies, math.atan2(move[1], move[0]))
         act = {"tick": obs["tick"], "move": move, "boost": boost, "aim": [yaw, 0.0]}
         if obs["offer"]:
             priority = ("servos", "nanites", "armor", "plating", "reactor", "jets", "capacitor", "gyros", "sensors")
+            if V7A_ENABLED:
+                priority = ("servos", "plating", "nanites", "jets", "armor", "reactor", "capacitor", "sensors", "gun_mag", "gyros")
             ranks = {name: rank for rank, name in enumerate(priority)}
             choices = obs["offer"]["choices"]
             act["pick"] = min(range(len(choices)), key=lambda i: ranks.get(choices[i]["id"], len(priority)))
-        if None in me["weapons"]:
+        if resource is not None:
+            act.update(resource)
+            return act
+        if not V7A_ENABLED and None in me["weapons"]:
             held = {weapon["kind"] for weapon in me["weapons"] if weapon}
             preference = {"lightning": 0, "mortar": 1, "laser": 2, "gun": 3}
             for item in sorted(obs["pickups"], key=lambda p: preference[p["kind"]]):

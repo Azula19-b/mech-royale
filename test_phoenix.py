@@ -175,7 +175,7 @@ class PhoenixTests(unittest.TestCase):
         self.obs["offer"] = {"choices": [{"id": "gun_damage"}, {"id": "armor"}, {"id": "sensors"}]}
         self.obs["pickups"] = [{"id": 8001, "kind": "mortar", "pos": [1, 0, 5]},
                                {"id": 8002, "kind": "lightning", "pos": [1, 0, 0]}]
-        self.obs["cubes"] = [{"pos": [5, 0, 0]}]
+        self.obs["cubes"] = [{"id": 5001, "pos": [5, 0, 0]}]
         act = self.bot.act(self.obs)
         self.assertEqual(act["pick"], 1)
         self.assertEqual(act["take"], 8002)
