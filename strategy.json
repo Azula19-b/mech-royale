@@ -1,0 +1,27 @@
+{
+  "zone_margin_m": 18,
+  "zone_projection_s": 12,
+  "zone_ring_fraction": 0.56,
+  "small_zone_ring_fraction": 0.43,
+  "outer_zone_threshold": 0.78,
+  "zone_return_fraction": 0.62,
+  "enemy_influence_range_m": 134,
+  "move_horizon_m": 8,
+  "projectile_horizon_s": 0.9,
+  "projectile_clearance_m": 12,
+  "boost_reserve_energy": 40,
+  "low_energy_fraction": 0.24,
+  "low_energy_boost_reserve": 58,
+  "emergency_threat_range_m": 52,
+  "gun_yaw_tolerance_rad": 0.19,
+  "gun_pitch_tolerance_rad": 0.13,
+  "laser_charge_fraction": 0.78,
+  "reload_ammo_threshold": 4,
+  "reload_safe_range_m": 55,
+  "upgrade_rank": {
+    "armor": 0, "plating": 1, "servos": 2, "nanites": 3,
+    "jets": 4, "reactor": 5, "capacitor": 6, "gun_rate": 7,
+    "gun_damage": 8, "lightning_efficiency": 9, "sensors": 10, "gyros": 11
+  },
+  "pickup_rank": {"lightning": 5, "gun": 3, "mortar": 2, "laser": 1}
+}
