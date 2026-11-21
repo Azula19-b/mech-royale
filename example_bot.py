@@ -328,6 +328,7 @@ class Bot:
                     act["take"] = item["id"]
                     break
         self.defense(obs, enemies, yaw, act)
+        act["fire"] = [False, False]
         return act
 
 
