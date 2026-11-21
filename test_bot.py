@@ -139,6 +139,30 @@ class ControllerRegression(unittest.TestCase):
         self.obs["t"] = 5.0
         self.assertEqual(b._select_state(self.obs,self.me,[],None)[0],"REPOSITION")
 
+    def test_v4_explore_reposition_hide_fight_and_endgame_states(self):
+        # Exercise each mode through the actual transition selector.
+        b = bot.V4Bot(self.hello)
+        self.obs["cubes"] = [{"id":1,"pos":[20,0,0]}]
+        self.assertEqual(b._select_state(self.obs,self.me,[],None)[0],"EXPLORE")
+        self.obs["cubes"] = []
+        self.obs["t"] += 1.0
+        self.assertEqual(b._select_state(self.obs,self.me,[],None)[0],"REPOSITION")
+
+        b = bot.V4Bot(self.hello)
+        self.me["hp"] = 600
+        self.obs["mechs"]=[self.enemy(100)]
+        self.obs["events"]=[{"type":"damaged","amount":10,"weapon":"gun","bearing":0,"by":99}]
+        threats=b._threats(self.obs,self.me)
+        self.assertEqual(b._select_state(self.obs,self.me,threats,None)[0],"HIDE")
+
+        b = bot.V4Bot(self.hello)
+        self.obs["events"]=[]
+        self.obs["mechs"]=[self.enemy(50)]
+        threats=b._threats(self.obs,self.me)
+        self.assertEqual(b._select_state(self.obs,self.me,threats,None)[0],"FIGHT")
+        self.obs["alive"]=4
+        self.assertEqual(b._select_state(self.obs,self.me,[],None)[0],"ENDGAME")
+
 
 if __name__ == "__main__":
     unittest.main()
