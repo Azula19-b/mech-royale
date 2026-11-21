@@ -1,6 +1,4 @@
-.git
-arena
-check
-protocol.md
-mechfight.schema.json
+__pycache__/
+test_*.py
+diagnose.py
 README.md
