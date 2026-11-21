@@ -6,6 +6,19 @@ from arena import Arena
 from combat import intercept
 
 
+AUDIO_THREAT_ENABLED = True
+AUDIO_LIFETIME = 1.2  # Match seconds, long enough to hear successive footsteps.
+AUDIO_HISTORY_LIMIT = 12
+AUDIO_MAX_PENALTY = 0.24  # Route-score units, smaller than a single cover-side penalty.
+AUDIO_MAX_DIVERSION = 0.55  # Radians, matching the existing per-decision turn limit.
+AUDIO_SWITCH_MARGIN = 0.02  # Require a clear improvement beyond V5's turn cost.
+AUDIO_KIND_WEIGHT = {
+    "gun": 0.09, "laser": 0.09, "lightning": 0.09, "mortar": 0.07,
+    "laser_charge": 0.055, "boost": 0.065, "jet": 0.05, "step": 0.045, "reload": 0.04,
+}
+AUDIO_BAND_WEIGHT = {"near": 1.0, "mid": 0.40, "far": 0.10}
+
+
 def wrap(yaw):
     return (yaw + math.pi) % math.tau - math.pi
 
@@ -33,6 +46,7 @@ class Bot:
         self.attack_bearing = None
         self.attack_until = -1
         self.last_damage = -math.inf
+        self.audio = []
 
     def threat_values(self, me, enemy):
         dx, dy = (b - a for a, b in zip(me["pos"][:2], enemy["pos"][:2]))
@@ -135,6 +149,78 @@ class Bot:
             nearest = max(nearest, risk)
         return score - 0.8 * pressure - 0.65 * nearest
 
+    def remember_audio(self, obs, enemies):
+        now = obs["t"]
+        self.audio = [cue for cue in self.audio if now - cue[0] < AUDIO_LIFETIME]
+        if not obs["sounds"]:
+            return
+        config = self.config["sound"]
+        # Two standard deviations, with room for movement since the sound.
+        tolerance = max(math.pi / 12, math.radians(2 * config["bearing_noise_deg"]))
+        pos = obs["self"]["pos"]
+        known = []
+        for enemy in enemies:
+            distance = math.dist(pos, enemy["pos"])
+            band = "near" if distance < config["near"] else "mid" if distance < config["mid"] else "far"
+            known.append((bearing(pos, enemy["pos"]), band))
+        for sound in obs["sounds"]:
+            kind, band = sound["kind"], sound["dist"]
+            if kind not in AUDIO_KIND_WEIGHT or sound["age"] >= AUDIO_LIFETIME:
+                continue
+            occurred = now - sound["age"]
+            yaw = wrap(sound["bearing"])
+            if any(band == known_band and abs(wrap(yaw - angle)) <= tolerance
+                   for angle, known_band in known):
+                continue
+            # Reports carry no event ID. Prefer merging ambiguous near-simultaneous cues.
+            if any(kind == old_kind and abs(occurred - when) < self.period / 2
+                   and abs(wrap(yaw - angle)) <= tolerance
+                   for when, angle, old_kind, _ in self.audio):
+                continue
+            cue = (occurred, yaw, kind, band)
+            if len(self.audio) < AUDIO_HISTORY_LIMIT:
+                self.audio.append(cue)
+            else:
+                oldest = min(range(len(self.audio)), key=lambda index: self.audio[index][0])
+                if occurred > self.audio[oldest][0]:
+                    self.audio[oldest] = cue
+
+    def audio_penalty(self, yaw, now):
+        # Linear decay in time and across a 60-degree sector on either side.
+        risk = sum(AUDIO_KIND_WEIGHT[kind] * AUDIO_BAND_WEIGHT[band]
+                   * max(0, 1 - (now - occurred) / AUDIO_LIFETIME)
+                   * max(0, 1 - abs(wrap(yaw - angle)) / (math.pi / 3))
+                   for occurred, angle, kind, band in self.audio)
+        return min(AUDIO_MAX_PENALTY, risk)
+
+    def audio_heading(self, obs, routes, baseline):
+        now = obs["t"]
+        yaw, score = baseline
+        best = score - self.audio_penalty(yaw, now) + AUDIO_SWITCH_MARGIN
+        chosen = yaw
+        me, zone = obs["self"], obs["zone"]
+        for option, base_score in routes:
+            if base_score <= best or option == yaw or abs(wrap(option - yaw)) > AUDIO_MAX_DIVERSION:
+                continue
+            # Let V5 smooth its original choice. Audio alternatives must already
+            # fit within that turn limit so their evaluated path is the one used.
+            if self.heading is not None and abs(wrap(option - self.heading)) > AUDIO_MAX_DIVERSION:
+                continue
+            adjusted = base_score - self.audio_penalty(option, now)
+            if adjusted <= best:
+                continue
+            dx, dy = direction(option)
+            x, y = me["pos"][:2]
+            endpoint = x + 24 * dx, y + 24 * dy
+            if (self.arena.edge(*endpoint) < 16
+                    or math.dist(endpoint, zone["center"]) > zone["radius"] - 5
+                    or math.dist(endpoint, zone["next_center"]) > zone["next_radius"] - 5
+                    or self.arena.walk(me["pos"], dx, dy, 1.5, me["stats"])[0] == 0
+                    or self.arena.walk(me["pos"], dx, dy, 24, me["stats"])[0] < 24):
+                continue
+            best, chosen = adjusted, option
+        return chosen
+
     def movement(self, obs, enemies, loot_goal=None):
         me = obs["self"]
         goal_yaw, urgency = self.zone_goal(obs)
@@ -149,7 +235,15 @@ class Bot:
         if enemies:
             away = wrap(bearing(me["pos"], enemies[0]["pos"]) + math.pi)
             options.extend((away - 0.55, away + 0.55))
-        yaw = wrap(max(options, key=lambda option: self.route_score(obs, option, goal_yaw, threats, urgency)))
+        routes = [(option, self.route_score(obs, option, goal_yaw, threats, urgency))
+                  for option in options]
+        baseline = max(routes, key=lambda route: route[1])
+        yaw = baseline[0]
+        if (AUDIO_THREAT_ENABLED and self.audio and not enemies and loot_goal is None
+                and me["in_zone"] and urgency == 0 and not obs.get("projectiles")
+                and not obs.get("beams") and obs["t"] - self.last_damage >= AUDIO_LIFETIME):
+            yaw = self.audio_heading(obs, routes, baseline)
+        yaw = wrap(yaw)
         if self.heading is not None:
             delta = wrap(yaw - self.heading)
             smooth = wrap(self.heading + max(-0.55, min(0.55, delta)))
@@ -311,6 +405,8 @@ class Bot:
         if any(event["type"] in ("damaged", "hit") for event in obs["events"]):
             self.last_damage = obs["t"]
         enemies = self.threats(obs)
+        if AUDIO_THREAT_ENABLED:
+            self.remember_audio(obs, enemies)
         move, boost = self.movement(obs, enemies, self.loot_goal(obs, enemies))
         yaw = self.armor_yaw(obs, enemies, math.atan2(move[1], move[0]))
         act = {"tick": obs["tick"], "move": move, "boost": boost, "aim": [yaw, 0.0]}

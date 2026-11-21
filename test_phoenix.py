@@ -1,13 +1,14 @@
 import math
 import gzip
 import json
+import os
 from pathlib import Path
 import unittest
 
 from example_bot import Bot
 from combat import intercept
 
-KIT = Path(__file__).resolve().parents[1] / "submission"
+KIT = Path(os.environ.get("MECHFIGHT_KIT", Path(__file__).resolve().parents[1] / "submission"))
 
 
 def hello():
