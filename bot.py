@@ -645,7 +645,7 @@ class V4Bot(RooftopBot):
             desired = "HIDE"
         elif nearest < 72 or (damaged and nearest < 105):
             desired = "FIGHT"
-        elif self.climb_phase not in ("done","failed") and self.roof:
+        elif self.climb_phase not in ("done","failed") and roof is not None:
             desired = "CLIMB"
         elif roof and me.get("energy",0) > 48 and not attackers:
             desired = "CLIMB"
