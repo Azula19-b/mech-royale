@@ -57,3 +57,25 @@ python3 -B phoenix/diagnose.py -- docker run --rm -i \
 ```
 
 The diagnostic harness reports to stderr. Put `--scenario squad --steps 4800` before the Docker command separator to exercise all 15 opponent records for a full-length stream.
+
+## Phoenix V10 Hunter
+
+Run `python3 -u hunter.py` or build the root Dockerfile. The V5 reference still
+runs via `python3 -u example_bot.py`. Set any of
+`V10_TRACKING_ENABLED`, `V10_COMBAT_ENABLED`, `V10_MOVEMENT_ENABLED`, and
+`V10_TACTICS_ENABLED` to `0` to disable it. Disable all four to replay V5
+actions. Set `MECHFIGHT_KIT` to the unpacked official kit directory for tests.
+
+```sh
+python3 -m unittest -v
+python3 diagnose.py --steps 600 --scenario duel --scenario pincer --scenario squad
+python3 diagnose.py --steps 600 --scenario duel --scenario pincer --scenario squad -- python3 -u example_bot.py
+python3 diagnose.py --stress --steps 1800 --scenario squad
+```
+
+The diagnostic harness uses identical geometry, pursuit rules and per-actor
+spread seeds for both controllers. It simulates a gun-only loadout, discrete
+movement and projectile contact, simplified opponent aim and firing cadence,
+a fixed zone schedule and simplified visibility. Opportunity ticks are
+geometric line-of-fire opportunities. They can include shots that are misaligned
+or undesirable. HP resets in stress mode measure runtime only.

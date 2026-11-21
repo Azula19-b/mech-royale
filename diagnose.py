@@ -5,6 +5,7 @@ import json
 import math
 from pathlib import Path
 import queue
+import random
 import subprocess
 import sys
 from tempfile import TemporaryDirectory, TemporaryFile
@@ -26,6 +27,7 @@ class DiagnosticBot(ProtocolBot):
         Thread(target=self._read, daemon=True).start()
 
 SCENARIOS = {
+    "duel": ((-32, 60), [(38, 60)], (0, 60), 120, 105),
     "pursuit": ((-70, 55), [(0, -60)], (0, 0), 135, 135),
     "pincer": ((0, 65), [(-55, -15), (55, -15), (0, 100)], (0, 35), 105, 105),
     "cover": ((-22, 0), [(-50, 27), (-75, -12)], (0, 0), 120, 100),
@@ -68,8 +70,12 @@ class Scenario:
         self.obs["zone"].update(center=list(center), next_center=list(center), radius=large,
                                 next_radius=small, shrink_start=4, shrink_end=15)
         self.large = large
-        self.last_damage = self.last_spend = self.last_shot = -10
+        self.last_damage = self.last_spend = -10
         self.stall = 0
+        self.heading = None
+        self.shots = []
+        self.random = {owner: random.Random(737 + owner) for owner in range(16)}
+        self.dead = False
         self.metrics = Counter()
 
     def advance(self, act):
@@ -78,6 +84,10 @@ class Scenario:
         now = obs["t"]
         stats = me["stats"]
         dx, dy = act.get("move", (0, 0))
+        if math.hypot(dx, dy) > 0.1:
+            yaw = math.atan2(dy, dx)
+            m["heading_reversals"] += self.heading is not None and abs(wrap(yaw - self.heading)) > math.pi / 2
+            self.heading = yaw
         scale = max(1, math.hypot(dx, dy))
         dx, dy = dx / scale, dy / scale
         m["jump_commands"] += bool(act.get("jump"))
@@ -150,24 +160,38 @@ class Scenario:
         m["threatened"] += bool(exposed)
         m["moved_threatened"] += bool(exposed) and traveled > 0.15
         m["stationary_exposed"] += bool(exposed) and traveled <= 0.15
+        gun = me["weapons"][0]
+        w = gun["stats"]
+        gun["cooldown"] = max(0, gun["cooldown"] - 0.1)
+        if gun["reload"]:
+            gun["reload"] = max(0, gun["reload"] - 0.1)
+            if gun["reload"] < 1e-8:
+                gun.update(reload=0, ammo=w["mag"])
+        origin = point3(me["pos"], stats["muzzle_height"])
+        opportunity = any(math.dist(origin, point3(actor["pos"], stats["height"] / 2)) < w["range"]
+                          and self.arena.clear(origin, point3(actor["pos"], stats["height"] / 2), spacing=2)
+                          for actor in targets)
+        fire = act.get("fire", [False, False])[0]
+        m["fire_commands"] += fire
+        m["opportunity_ticks"] += opportunity
+        m["unfired_ready_ticks"] += opportunity and not gun["cooldown"] and not gun["reload"] and not fire
+        if act.get("reload") and gun["ammo"] < w["mag"] and not gun["reload"]:
+            gun["reload"] = w["reload"]
+        if fire and not gun["cooldown"] and not gun["reload"] and gun["ammo"]:
+            self.launch(origin, me["aim"], w, None, w["damage"])
+            m["shots"] += 1
+            gun["ammo"] -= 1
+            gun["cooldown"] = w["cooldown"]
+            if not gun["ammo"]:
+                gun["reload"] = w["reload"]
         for actor in exposed:
             if (obs["tick"] // 2 + actor["id"]) % 6 == 0:
-                yaw = bearing(me["pos"], actor["pos"])
-                rear = abs(wrap(yaw - me["aim"][0])) > math.radians(stats["front_arc_deg"]) / 2
-                damage = 18 * (stats["rear_mult"] if rear else 1)
-                obs["events"].append({"type": "damaged", "amount": damage, "bearing": yaw,
-                                      "by": actor["id"], "weapon": "gun", "rear": rear})
-                m["hits_received"] += 1
-                m["rear_hits"] += rear
-        gun = me["weapons"][0]["stats"]
-        if act.get("fire", [False, False])[0] and now - self.last_shot >= gun["cooldown"]:
-            self.last_shot = now
-            for actor in exposed:
-                distance = math.dist(me["pos"], actor["pos"])
-                if abs(wrap(me["aim"][0] - bearing(me["pos"], actor["pos"]))) < math.atan2(3, distance):
-                    obs["events"].append({"type": "hit", "target": actor["id"], "amount": gun["damage"], "weapon": "gun"})
-                    m["damage_out"] += gun["damage"]
-                    break
+                origin = point3(actor["pos"], stats["muzzle_height"])
+                flight = math.dist(actor["pos"], me["pos"]) / w["speed"]
+                point = tuple(p + v * flight for p, v in zip(point3(me["pos"], stats["height"] / 2), me["vel"]))
+                pitch = math.atan2(point[2] - origin[2], math.dist(point[:2], origin[:2]))
+                self.launch(origin, (bearing(origin, point), pitch), w, actor["id"], w["damage"] * 0.40)
+        self.advance_projectiles(me, targets, obs["events"])
         incoming = sum(e["amount"] for e in obs["events"] if e["type"] == "damaged")
         m["damage_in"] += incoming
         me["hp"] -= incoming
@@ -175,12 +199,69 @@ class Scenario:
             self.last_damage = now
         elif now - self.last_damage >= stats["regen_delay"] and me["in_zone"]:
             me["hp"] = min(me["max_hp"], me["hp"] + stats["regen_per_s"] / 10)
-        if me["hp"] <= 0:
-            # Keep the deterministic stream alive and record losses separately.
-            m["hp_resets"] += 1
-            me["hp"] = me["max_hp"]
+        m["survival_s"] = now - 1 + 0.1
+        self.dead = me["hp"] <= 0
         obs["tick"] += 2
         obs["t"] = round(now + 0.1, 2)
+
+    def launch(self, origin, aim, weapon, owner, damage):
+        spread = math.radians(weapon["spread_deg"])
+        yaw, pitch = (axis + self.random[owner or 0].gauss(0, spread) for axis in aim)
+        ray = math.cos(yaw) * math.cos(pitch), math.sin(yaw) * math.cos(pitch), math.sin(pitch)
+        offset = self.config["mech"]["radius"] + 0.5
+        muzzle = tuple(p + offset * d for p, d in zip(origin, ray))
+        if self.arena.clear(origin, muzzle, spacing=1):
+            velocity = tuple(d * weapon["speed"] for d in ray)
+            self.shots.append((muzzle, velocity, weapon["range"], owner, damage))
+
+    def advance_projectiles(self, me, targets, events):
+        stats = me["stats"]
+        m = self.metrics
+        survivors = []
+        for position, velocity, remaining, owner, damage in self.shots:
+            speed = math.hypot(*velocity)
+            duration = min(0.1, remaining / speed)
+            end = tuple(p + v * duration for p, v in zip(position, velocity))
+            contact = None
+            for actor in ([me] if owner is not None else targets):
+                if actor["hp"] <= 0:
+                    continue
+                x, y, z = actor["pos"]
+                vx, vy, vz = velocity
+                time = ((x - position[0]) * vx + (y - position[1]) * vy) / max(1e-6, vx * vx + vy * vy)
+                time = max(0, min(duration, time))
+                point = tuple(p + v * time for p, v in zip(position, velocity))
+                if (math.hypot(point[0] - x, point[1] - y) <= stats["radius"] + self.config["projectile"]["gun_radius"]
+                        and z <= point[2] <= z + stats["height"]
+                        and (contact is None or time < contact[0])):
+                    contact = time, point, actor
+            if contact and self.arena.clear(position, contact[1], spacing=1):
+                actor = contact[2]
+                direction = math.atan2(-velocity[1], -velocity[0])
+                rear = abs(wrap(direction - actor["aim"][0])) > math.radians(stats["front_arc_deg"]) / 2
+                damage *= stats["rear_mult"] if rear else 1
+                if owner is not None:
+                    m["hits_received"] += 1
+                    m["rear_hits"] += rear
+                    events.append({"type": "damaged", "by": owner, "amount": damage,
+                                   "weapon": "gun", "bearing": direction, "rear": rear})
+                else:
+                    m["hits"] += 1
+                    m["damage_out"] += min(actor["hp"], damage)
+                    actor["hp"] -= damage
+                    events.append({"type": "hit", "target": actor["id"], "amount": damage, "weapon": "gun"})
+                    if actor["hp"] <= 0:
+                        m["kills"] += 1
+                        if m["kills"] == 1:
+                            m["first_kill_s"] = self.obs["t"] - 1 + 0.1
+                        events.append({"type": "kill", "target": actor["id"]})
+            elif remaining > speed * duration and self.arena.clear(position, end, spacing=1):
+                survivors.append((end, velocity, remaining - speed * duration, owner, damage))
+        targets[:] = [actor for actor in targets if actor["hp"] > 0]
+        self.obs["alive"] = len(targets) + 1
+        self.shots = survivors
+        self.obs["projectiles"] = [{"id": i, "kind": "gun", "pos": p, "vel": v}
+                                   for i, (p, v, _, owner, _) in enumerate(survivors) if owner is not None]
 
 
 def read(bot, seconds, limit):
@@ -203,7 +284,7 @@ def valid_numbers(value):
     return True
 
 
-def run(command, message, schema, scenario, count):
+def run(command, message, schema, scenario, count, stress=False):
     stderr = TemporaryFile()
     bot = DiagnosticBot(command, stderr)
     times = []
@@ -223,6 +304,12 @@ def run(command, message, schema, scenario, count):
                 raise RuntimeError(f"invalid action for tick {scenario.obs['tick']}: {act!r} {errors}")
             times.append((at - start) * 1000)
             scenario.advance(act)
+            if scenario.dead:
+                if not stress:
+                    break
+                # Keep the observation load high. The reset run measures timing only.
+                scenario.obs["self"]["hp"] = scenario.obs["self"]["max_hp"]
+                scenario.dead = False
         bot.send({"type": "end", "place": 1, "kills": 0})
         bot.proc.stdin.close()
         if bot.proc.wait(timeout=5):
@@ -243,11 +330,12 @@ def run(command, message, schema, scenario, count):
 
 def summary(times):
     ordered = sorted(times)
-    return "p50/p99/max=" + "/".join(f"{ordered[math.ceil(len(ordered) * q) - 1]:.2f}" for q in (0.5, 0.99, 1)) + " ms"
+    return "p50/p90/p99/max=" + "/".join(f"{ordered[math.ceil(len(ordered) * q) - 1]:.2f}" for q in (0.5, 0.9, 0.99, 1)) + " ms"
 
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--stress", action="store_true", help="Reset HP after death for timing-only stress")
     parser.add_argument("--steps", default=480, type=int)
     parser.add_argument("--scenario", choices=SCENARIOS, action="append")
     parser.add_argument("command", nargs=argparse.REMAINDER)
@@ -263,18 +351,19 @@ def main():
         command = args.command
         if command[:1] == ["--"]:
             command = command[1:]
-        command = command or [sys.executable, "-B", "-u", str(Path(__file__).with_name("example_bot.py"))]
+        command = command or [sys.executable, "-B", "-u", str(Path(__file__).with_name("hunter.py"))]
         message["map"]["dir"] = "/arena" if any("{map}" in arg for arg in command) else directory
         command = [item.replace("{map}", directory) for item in command]
         arena = Arena(root)
         times = []
         for name in args.scenario or (name for name in SCENARIOS if name != "squad"):
             scenario = Scenario(name, arena, message["config"])
-            sample = run(command, message, schema, scenario, args.steps)
+            sample = run(command, message, schema, scenario, args.steps, args.stress)
             times.extend(sample)
             metrics = " ".join(f"{key}={value:.1f}" if isinstance(value, float) else f"{key}={value}"
                                for key, value in sorted(scenario.metrics.items()))
-            print(f"{name}: {summary(sample)} {metrics}", file=sys.stderr)
+            details = "HP reset stress (timing only)" if args.stress else metrics
+            print(f"{name}: {summary(sample)} {details}", file=sys.stderr)
         budget = message["config"]["bot"]["tick_budget_ms"]
         late = sum(t > budget for t in times)
         print(f"{len(times)} actions {summary(times)} late={late} invalid=0 crashes=0", file=sys.stderr)
