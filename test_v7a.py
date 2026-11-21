@@ -80,8 +80,11 @@ class OpeningTests(TestCase):
         source = subprocess.check_output(["git", "show", "990f4a2:example_bot.py"])
         exec(compile(source, "v5", "exec"), namespace)
         reference, candidate = namespace["Bot"](self.message), example_bot.Bot(self.message)
+        count = 0
         with patch.object(example_bot, "V7A_ENABLED", False), gzip.open(KIT / "check/stream.jsonl.gz", "rt") as stream:
             for line in stream:
                 obs = json.loads(line)
-                if obs["type"] == "observation":
+                if obs["type"] == "obs":
+                    count += 1
                     self.assertEqual(candidate.act(obs), reference.act(obs), obs["tick"])
+        self.assertEqual(count, 300)
